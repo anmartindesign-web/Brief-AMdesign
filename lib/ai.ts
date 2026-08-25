@@ -1,20 +1,20 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI, Part } from "@google/genai";
 import { CONTENT_SCHEMAS } from "./schemas";
 import { getPageConfig, getTemplateByKey } from "./templates";
 import { ContentType, GeneratedContent, PageConfig, ProjectInputs } from "./types";
 
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
+const MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
 
-let client: Anthropic | null = null;
-function getClient(): Anthropic {
+let client: GoogleGenAI | null = null;
+function getClient(): GoogleGenAI {
   if (!client) {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       throw new Error(
-        "ANTHROPIC_API_KEY is not configured. Add it to your environment to enable generation.",
+        "GEMINI_API_KEY is not configured. Add it to your environment to enable generation.",
       );
     }
-    client = new Anthropic({ apiKey });
+    client = new GoogleGenAI({ apiKey });
   }
   return client;
 }
@@ -76,9 +76,9 @@ artificially sophisticated language, unsupported claims, overly poetic descripti
 psychology, and generic photography recommendations. Prioritize strategic precision over filling \
 space -- respect the requested lengths and counts exactly.
 
-You must always respond by calling the provided "submit_content" tool with content that matches \
-its schema exactly. Never include any explanation, preamble, or chain-of-thought in your response \
--- only the strategic content itself, inside the tool call.`;
+You must always respond with a single JSON object that matches the provided response schema \
+exactly. Never include any explanation, preamble, markdown formatting, or chain-of-thought in \
+your response -- only the strategic content itself, as raw JSON.`;
 
 // ---------------------------------------------------------------------------
 // Prompt construction
@@ -167,53 +167,41 @@ export async function generatePageContent({
   const variationSeed = regenerate ? Math.random().toString(36).slice(2, 8) : undefined;
   const promptText = buildUserPrompt(page, inputs, variationSeed);
 
-  const content: Anthropic.MessageParam["content"] = [{ type: "text", text: promptText }];
+  const parts: Part[] = [{ text: promptText }];
 
   if (page.usesLogo && inputs.logo) {
     const base64 = stripDataUrlPrefix(inputs.logo.dataUrl);
-    if (inputs.logo.kind === "pdf") {
-      content.push({
-        type: "document",
-        source: { type: "base64", media_type: "application/pdf", data: base64 },
-      } as Anthropic.DocumentBlockParam);
-    } else {
-      content.push({
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: inputs.logo.mediaType as "image/png" | "image/jpeg",
-          data: base64,
-        },
-      } as Anthropic.ImageBlockParam);
-    }
+    const mimeType = inputs.logo.kind === "pdf" ? "application/pdf" : inputs.logo.mediaType;
+    parts.push({ inlineData: { data: base64, mimeType } });
   }
 
   const schema = CONTENT_SCHEMAS[page.contentType];
 
-  const response = await getClient().messages.create({
+  const response = await getClient().models.generateContent({
     model: MODEL,
-    max_tokens: 2048,
-    temperature: regenerate ? 1 : 0.7,
-    system: SYSTEM_PROMPT,
-    tools: [
-      {
-        name: "submit_content",
-        description: "Submit the generated brand book content for this page.",
-        input_schema: schema as Anthropic.Tool.InputSchema,
-      },
-    ],
-    tool_choice: { type: "tool", name: "submit_content" },
-    messages: [{ role: "user", content }],
+    contents: [{ role: "user", parts }],
+    config: {
+      systemInstruction: SYSTEM_PROMPT,
+      temperature: regenerate ? 1 : 0.7,
+      maxOutputTokens: 4096,
+      responseMimeType: "application/json",
+      responseJsonSchema: schema,
+    },
   });
 
-  const toolUse = response.content.find(
-    (block): block is Anthropic.ToolUseBlock => block.type === "tool_use",
-  );
-  if (!toolUse) {
+  const text = response.text;
+  if (!text) {
     throw new Error("The model did not return structured content. Please try again.");
   }
 
-  return { type: page.contentType, ...(toolUse.input as object) } as GeneratedContent;
+  let parsed: object;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("The model returned malformed content. Please try again.");
+  }
+
+  return { type: page.contentType, ...parsed } as GeneratedContent;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,32 +212,28 @@ export async function extractBriefFromPdf(
   base64: string,
   mediaType: string = "application/pdf",
 ): Promise<string> {
-  const response = await getClient().messages.create({
+  const response = await getClient().models.generateContent({
     model: MODEL,
-    max_tokens: 4096,
-    system:
-      "You transcribe documents into clean plain text for downstream processing. Return only " +
-      "the full textual content of the document, preserving meaning and structure with simple " +
-      "line breaks. Do not summarize, do not add commentary, do not invent content that is not " +
-      "in the document.",
-    messages: [
+    contents: [
       {
         role: "user",
-        content: [
-          {
-            type: "document",
-            source: { type: "base64", media_type: mediaType as "application/pdf", data: base64 },
-          } as Anthropic.DocumentBlockParam,
-          { type: "text", text: "Transcribe this document's full text content." },
+        parts: [
+          { inlineData: { data: base64, mimeType: mediaType } },
+          { text: "Transcribe this document's full text content." },
         ],
       },
     ],
+    config: {
+      systemInstruction:
+        "You transcribe documents into clean plain text for downstream processing. Return only " +
+        "the full textual content of the document, preserving meaning and structure with simple " +
+        "line breaks. Do not summarize, do not add commentary, do not invent content that is not " +
+        "in the document.",
+      maxOutputTokens: 8192,
+    },
   });
 
-  const textBlock = response.content.find(
-    (block): block is Anthropic.TextBlock => block.type === "text",
-  );
-  return textBlock?.text?.trim() || "";
+  return response.text?.trim() || "";
 }
 
 function stripDataUrlPrefix(dataUrl: string): string {

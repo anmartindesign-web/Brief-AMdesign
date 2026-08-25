@@ -1,6 +1,6 @@
 import { ContentType } from "./types";
 
-// JSON Schemas used as Anthropic tool `input_schema` definitions, forcing the
+// JSON Schemas used as Gemini `responseJsonSchema` definitions, forcing the
 // model to return structured, directly-renderable content instead of loose
 // prose. One schema per ContentType; add a new content type by adding an
 // entry here and to lib/types.ts / components/content renderers.
